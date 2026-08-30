@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Environment / secrets — never commit
+.env
+.env.*
+*.key
+*.pem
+*secret*
+*credential*
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Large competition data — NOT redistributed here; download separately.
+# See SETUP.md. Derived from Amazon Reviews 2023 (McAuley Lab, UCSD).
+techjam-conversational-search/data/catalog.jsonl
+techjam-conversational-search/data/catalog.jsonl.gz
+techjam-conversational-search/data/releases/
+
+# Locally generated kit baseline results
+techjam-conversational-search/results.json
+
+# Logs / scratch
+*.log
