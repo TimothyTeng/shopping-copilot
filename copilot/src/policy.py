@@ -101,6 +101,10 @@ _OVERRIDE_ACK = (
 
 
 def _phrase_of(slot) -> str:
+    """A slot rendered for the shopper: at most six words, elided after.
+
+    Cosmetic only. The simulator never reads `message` (it branches on
+    `ask_attribute` alone), so wording changes must be score-neutral."""
     text = slot.phrase or slot.key
     words = text.split()
     return " ".join(words[:6]) + ("…" if len(words) > 6 else "")

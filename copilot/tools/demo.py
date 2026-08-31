@@ -42,11 +42,13 @@ DIM, BOLD, GREEN, YELLOW, CYAN, RESET = (
 
 
 def short(text: str, width: int = 68) -> str:
+    """Truncate a product title for the terminal, on a word boundary."""
     text = " ".join(str(text).split())
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def build(**overrides) -> Agent:
+    """Construct the agent for a demo, honouring `--retrieval` and friends."""
     print(f"{DIM}loading 50,000 products…{RESET}")
     agent = Agent(config.CATALOG_PATH, config.DEFAULT.replace(**overrides)
                   if overrides else config.DEFAULT)
@@ -56,6 +58,8 @@ def build(**overrides) -> Agent:
 
 # --------------------------------------------------------------------------
 def cmd_replay(args) -> None:
+    """`demo replay` — play a labelled session turn by turn with the hidden
+    target revealed, so the ranking can be watched closing in on it."""
     samples = load_jsonl(KIT_ROOT / "data" / "public_set.jsonl")
     if args.sample:
         pool = [s for s in samples if s["sample_id"] == args.sample]
@@ -182,6 +186,9 @@ def cmd_replay(args) -> None:
 
 # --------------------------------------------------------------------------
 def cmd_chat(args) -> None:
+    """`demo chat` — talk to the agent yourself. Defaults to bm25 retrieval:
+    free text is a different surface from the benchmark, and the conjunctive
+    ordering measures ~0.24 worse on it."""
     # The hold-back gate exists only because a scored session ends at the first
     # hit, so an early weak list locks in a bad rank. A real person is under no
     # such rule and just wants to see results, so it is disabled here.
@@ -234,6 +241,7 @@ def cmd_chat(args) -> None:
 
 
 def main() -> None:
+    """CLI entry point: replay | chat."""
     parser = argparse.ArgumentParser(description="Shopping Copilot demo")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

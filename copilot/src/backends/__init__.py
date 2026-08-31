@@ -36,6 +36,8 @@ class Expansion:
 
     @property
     def ok(self) -> bool:
+        """True when the expansion carries usable text. Every caller must check:
+        a timeout, a refusal or an unreachable endpoint all return an empty one."""
         return bool(self.text.strip())
 
 

@@ -61,6 +61,8 @@ class DenseIndex:
     __slots__ = ("vectors", "model", "meta", "_encoder")
 
     def __init__(self, vectors, meta: dict) -> None:
+        """Hold pre-encoded product vectors; the query encoder is loaded lazily,
+        on the first query, so importing this module does not pull in torch."""
         self.vectors = vectors
         self.meta = meta
         self.model = str(meta.get("model", ""))

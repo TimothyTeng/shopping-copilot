@@ -7,13 +7,14 @@ actually bought into a top-10 list, as early and as highly ranked as possible.
 **Draft 2.** Working end to end, scored by the official evaluator. Pure Python
 standard library — no LLM, no network, no external services.
 
-Three reference documents sit alongside this one:
+Four reference documents sit alongside this one:
 
 | | |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | what the product is, how the stages connect, and what they score |
 | [docs/ALGORITHMS.md](docs/ALGORITHMS.md) | every algorithm tried, the mechanism in detail, and why it passed or failed |
 | [docs/algorithm-audit.md](docs/algorithm-audit.md) | the session-by-session experiment record the two above are drawn from |
+| [docs/results.md](docs/results.md) | the 2026-08-31 run record: both suites at current defaults, with the saved transcripts read back |
 
 ## Results
 
@@ -33,7 +34,12 @@ point estimate:
 | `tie_rerank=mmr` | 0.9456 | +0.0074 | [+0.0017, +0.0138] | 0.997 |
 | `card_signature` | **0.9626** | +0.0170 | [+0.0093, +0.0256] | 1.000 |
 
-Reproduce either with `python -m tools.harness ci --compare card_signature=false`.
+Reproduce either with `python3 -m tools.harness ci --compare card_signature=false`.
+Those two rows are a *build-up history*, each delta measured as it landed. Flipped
+off in the tree as it stands today, `card_signature` is still worth −0.0169
+([−0.0256, −0.0093]) but `tie_rerank` is worth −0.0103 ([−0.0167, −0.0048]), more
+than its recorded +0.0074 — the signature creates the tied clusters MMR then
+orders, so the two interact. See [docs/results.md](docs/results.md) §1.
 
 Per scenario — every scenario at perfect recall:
 
@@ -99,26 +105,152 @@ For comparison, an earlier regex-based prototype scored **0.928 on L0 and 0.000
 on L1** — a total collapse, silent under normal testing. That result is why
 extraction here is grounded in the catalog rather than in sentence structure.
 
-## Setup
+## Setup and installation
 
-Requires Python 3.10+. The agent itself needs **no third-party packages**; only
-the optional `tools/exp_vector.py` experiment needs numpy/scipy/scikit-learn.
+**Requirements: Python 3.10 or later, and nothing else.** The agent is pure
+standard library — no pip install, no virtualenv needed, no network at run time.
+Only optional experiments outside the scored path need third-party packages
+(`tools/exp_vector.py` needs numpy/scipy/scikit-learn; `src/dense.py` needs
+torch and sentence-transformers; the model tier needs an OpenAI-compatible
+endpoint). None of them are imported unless the corresponding switch is on.
 
-```bash
-python -m tools.harness run
+**1. Lay the two directories out side by side.** The official kit is a sibling
+of this one and is never modified:
+
+```
+techjam-conversational-search/   the organizers' kit — READ-ONLY
+copilot/                         this directory
 ```
 
-Run from this directory. The official kit must sit alongside it as
-`../techjam-conversational-search`, with `data/catalog.jsonl` present
-(downloaded from the participant-kit release and SHA256-verified).
+**2. Get the catalog.** It is not in the repository. Download
+`catalog.jsonl.gz` from the kit's GitHub release, verify it, and unpack it into
+the kit's own `data/`:
 
 ```bash
-python -m tools.harness run       # official score, per-scenario breakdown
-python -m tools.harness perturb   # robustness curve across phrasings
-python -m tools.harness ablate    # contribution of each design decision
+cd ../techjam-conversational-search/data
+sha256sum -c --ignore-missing SHA256SUMS   # must print "catalog.jsonl.gz: OK"
+gzip -dk catalog.jsonl.gz        # leaves catalog.jsonl alongside it
 ```
 
-## Try it
+**3. Check the installation.** One command, non-zero exit on any failure:
+
+```bash
+cd ../../copilot
+PYTHONIOENCODING=utf-8 python3 -m tools.check
+```
+
+It verifies three things: the kit is untouched (`git status` scoped to that
+path), our mirrored copies of the evaluator's own functions still agree with it
+across all 50,000 products, and the official score still comes out at the number
+this README documents. A clean run ends in `PASS`.
+
+`PYTHONIOENCODING=utf-8` matters on Windows only, where the console default
+(cp1252) crashes on product titles containing emoji or typographic dashes. It is
+harmless everywhere else, so every command below carries it.
+
+Everything is run from this directory, as a module (`python3 -m tools.x`), so
+the imports resolve without installing anything. Commands are written `python3`
+throughout; on Windows that is `python`, and older sections below still use the
+short form — they are the same command.
+
+## Reproducing the results
+
+Every number in this README comes from one of these commands. All are
+deterministic at a fixed seed, and none touch the network. Total runtime for the
+whole set is a few minutes, dominated by the ~10 s index build each process
+pays once.
+
+**The headline score** — 0.9626 on the official 200-session public set, via the
+unmodified evaluator:
+
+```bash
+PYTHONIOENCODING=utf-8 python3 -m tools.harness run
+```
+
+**The two defaults that earned their place**, each as a paired bootstrap rather
+than a point estimate (this is what produced the CIs in *Results*):
+
+```bash
+PYTHONIOENCODING=utf-8 python3 -m tools.harness ci --compare tie_rerank=none
+PYTHONIOENCODING=utf-8 python3 -m tools.harness ci --compare card_signature=false
+```
+
+**Robustness and ablation** — the paraphrase curve L0–L4, and the contribution
+of each design decision measured by switching it off:
+
+```bash
+PYTHONIOENCODING=utf-8 python3 -m tools.harness perturb
+PYTHONIOENCODING=utf-8 python3 -m tools.harness ablate
+```
+
+**The free-text score**, which is a different world and never averaged with the
+one above. Two probe sets (26 hand-authored, authoritative; 427 generated,
+higher resolution) and two retrieval modes (`conjunctive` is the graded default,
+`bm25` is the chat default):
+
+```bash
+PYTHONIOENCODING=utf-8 python3 -m tools.stress --track natural
+PYTHONIOENCODING=utf-8 python3 -m tools.stress --track natural --retrieval bm25
+PYTHONIOENCODING=utf-8 python3 -m tools.stress --track natural \
+    --probes data/probes_generated.jsonl
+PYTHONIOENCODING=utf-8 python3 -m tools.stress --track natural --retrieval bm25 \
+    --probes data/probes_generated.jsonl
+```
+
+Each run prints its own bootstrap CI and a paired delta against two independent
+BM25 controls, so a result is reported as an interval rather than a point.
+
+**The conversations themselves** — every turn of 50 benchmark sessions and all
+26 prose probes, with the full top-10 and the hidden target flagged on each
+turn:
+
+```bash
+PYTHONIOENCODING=utf-8 python3 -m tools.transcripts --n 50 --out results/transcripts.json
+```
+
+Written to `results/transcripts.json`; `results/transcripts.html` is the same
+data as a readable session log.
+
+**[`docs/results.md`](docs/results.md) is the run record**: the output of all six
+commands on one tree on one day, with the transcripts read back and the failures
+enumerated. If a number here and a number there disagree, that file is the
+measured one.
+
+## Try it in a browser
+
+```bash
+PYTHONIOENCODING=utf-8 python3 -m tools.webapp     # then open http://127.0.0.1:8000
+```
+
+`tools/webapp.py` is a self-contained local UI — standard library only, one
+embedded page, no build step and no CDN, so it works with the network off like
+everything else here. Two tabs:
+
+**Shop.** Type what you are looking for; the agent answers with a question and
+its current top 10, and you click a product when it is the one you meant.
+*"Give me a random item to describe"* pulls a real catalog product, shows you
+its page, and asks you to describe it in your own words — which is the whole
+free-text problem in miniature, since you will not use the catalog's vocabulary.
+When a random item is in play the target is highlighted in the results and your
+pick is marked right or wrong. Each turn also shows what the agent actually
+understood (resolved category, active clues), which is the useful part when it
+is wrong. This tab runs the `demo chat` configuration: `retrieval=bm25`, fuzzy
+repair and doc2query on, hold-back gate off.
+
+**Tests.** Runs either suite in the browser and streams results as they land:
+per-case PASS/FAIL, rank, turn, and a running composite. Click any row to see
+the whole session — every question the agent asked, every answer the simulated
+shopper gave, and the top 10 at each turn with the hidden target marked, so a
+failure can be read rather than guessed at. Each run builds a fresh agent at the
+graded defaults with only the retrieval mode varied, so the numbers match the
+command line rather than the chat surface: verified at **0.9626** for all 200
+benchmark sessions, **0.3985** conjunctive and **0.6339** bm25 on the 26 prose
+probes — identical to `tools.harness run` and `tools.stress` respectively.
+
+It is a viewer, not a second implementation: the conversations come from
+`tools/transcripts.py`, which drives the official session loop.
+
+## Try it on the command line
 
 Watch a real labelled session play out turn by turn, with the hidden target
 revealed up front so you can see the ranking close in on it:
@@ -249,6 +381,100 @@ between `scoped`, `erase`, and `keep`.)
   tier is now built and measured (see below); it is **off by default**, so the
   shipped default is still lexical-only and safe if final scoring runs with
   network access disabled.
+
+## What I would do with more time
+
+Ranked by expected value, and each sized against a measurement rather than a
+hunch — several obvious-sounding items are missing from this list precisely
+because they were built, measured, and rejected (see *Measured and rejected*).
+
+1. **Close the vocabulary gap properly.** This is the whole free-text problem
+   and everything else is a rounding error next to it. The stress harness's own
+   oracle localises it exactly: query the catalog with *the product's own words*
+   and the score is 0.98–0.999, so the targets are findable and the failure is
+   purely that a shopper's words are not the catalog's words. Two corpus-internal
+   attempts at the bridge (PPMI term associations, RM3 pseudo-relevance feedback)
+   were built and both measured negative at every strength, for the same reason:
+   a per-term synonym drags in documents that contain the synonym and nothing
+   else. The translation has to apply to the whole request at once. Two routes
+   are already scaffolded and unfinished: **doc2query** (`tools/doc2query.py`
+   generates, offline, what a shopper would type to find each product, keeping
+   the scored path network-free) and **dense retrieval fused by RRF**, which
+   `tools/exp_dense.py` measures at 0.735 against lexical's 0.691 on the prose
+   path, rescuing 42 probes lexical misses outright. Finishing either is the
+   single highest-value piece of work left.
+2. **Make category resolution revisable.** `Agent._observe` resolves the
+   category once and never again, so "actually, never mind — I need women's
+   sweatpants" keeps searching shoes for the rest of the session. That is one of
+   the 13 stress failures and it is a structural bug, not a tuning gap. The fix
+   is entangled with a trap worth stating: `suppress = category_key.split()`
+   means a *more accurate* resolver suppresses more of the shopper's own words
+   from extraction, so on free text accuracy cancels itself — an oracle-category
+   study measured the full oracle at **−0.037**. Any work here has to decouple
+   suppression (`suppress_category_tokens`, now a switch) before it can pay.
+3. **Re-open `enable_reset` for negation.** `negation` is the weakest tag on the
+   prose path (0.6502 against `multi_attr`'s 0.8463, n=61), and `config.py`
+   records `enable_reset` as a *correct* mechanism that measures neutral — parked
+   because at n=26 the single probe it targeted was mis-bucketed by the vote
+   resolver. The generated set now gives enough signal to judge it properly.
+4. **Validate the generated probe set.** `data/adjudication.jsonl` is generated
+   and unfilled, so every n=427 number carries a qualitative caveat
+   ("model-written") where it could carry a bounded one. `tools/adjudicate.py`
+   already produces the blind sheet and the Wilson intervals; it needs a human
+   afternoon, not more code.
+5. **Fix the interior-glue defect in coverage.** `_coverage` requires every
+   token of a slot to be present, so a fragment like `"plus design"` forces
+   `plus` into the conjunction. `slot_cover_floor` (a slot counts as met at 85%
+   of its own IDF mass) is implemented and measures 0.9628 against 0.9626 —
+   inside noise. The defect is real; this surface cannot see its cost, which is
+   an argument for a surface that can, not for shipping the switch.
+6. **Stop treating L2 as settled.** L2 noisy sits at 0.649 / Hit@10 0.760, the
+   largest unresolved robustness gap, though it is our own synthetic stressor
+   and harsher than a plausible organizer paraphrase (L1 holds at 0.926).
+
+What I would deliberately *not* spend time on: any further benchmark ranking
+work. The target is never missed, it is rank 1 in 191 of 200 sessions, and in
+all 9 exceptions a product above it carries the **identical** disclosed card
+slots — indistinguishable under the simulator's own construction. Total
+remaining ordering headroom is **+0.0099** composite, well inside the ±0.03
+noise floor at n=200. That number is the reason the learned ranking prior and
+the profile-affinity prior were both scoped and then not built.
+
+## How the code is laid out
+
+```
+src/                    the agent — standard library only, no network
+  agent.py              orchestration: observe → rank → decide whether to speak
+  catalog.py            product store; MIRRORS three evaluator functions exactly
+  normalize.py          the one tokenizer, shared by both sides of every match
+  index.py              inverted index, IDF, verified phrase matching
+  category.py           coarse-category buckets and ancestor prefixes
+  extract.py            requirements as catalog-grounded token runs, not parsing
+  state.py              per-session slots, override scoping, implicit rejection
+  rank.py               IDF coverage, log-product conjunction, tie re-ranking
+  policy.py             what to ask, when to commit a list, and the wording
+  config.py             every tunable, each with its measurement in the comment
+  bm25.py               term-frequency index, for the prose retrieval modes
+  fuzzy.py assoc.py doc2query.py dense.py category_clf.py   optional signals
+  backends/             the optional model tier: protocol, null impl, HyDE
+tools/                  offline only; nothing in src/ imports any of it
+  harness.py            official score, perturbation curve, ablation, CIs
+  stress.py             the independent free-text suite with paired bootstraps
+  transcripts.py        dump every turn of both worlds to JSON
+  demo.py               replay a labelled session, or chat with it yourself
+  webapp.py             a local browser UI: shop by typing, or run the suites
+  check.py              the three invariants, one command, non-zero on failure
+  verify_mirror.py      all 50,000 products against the kit's own functions
+```
+
+Two conventions run through all of it. **Every tunable is a field of
+`config.Settings`**, so an experiment is a one-line override rather than a code
+change and the harness can sweep configurations in one process — which is also
+why rejected ideas survive as switches with the measurement recorded in the
+comment instead of being deleted. And **comments explain why, not what**: the
+mechanism is readable from the code, but the reason a threshold is 0.85, or the
+reason a plausible alternative is not used, is only recoverable from the
+measurement that settled it.
 
 ## The optional model tier
 

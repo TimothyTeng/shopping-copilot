@@ -26,6 +26,12 @@ class Agent:
         catalog_path: str | Path = config.CATALOG_PATH,
         settings: config.Settings | None = None,
     ) -> None:
+        """Build the index and whichever optional signals `settings` enables.
+
+        Costs ~10 s once (catalog parse plus postings) and is shared by every
+        session; per-session state lives in `DialogueState`, not here. Every
+        optional component is imported inside its own branch, so the default
+        agent never imports torch, a model client, or a trained table."""
         self.cfg = settings or config.DEFAULT
         self.store = CatalogStore.load(catalog_path)
         self.index = InvertedIndex(self.store)
@@ -75,9 +81,16 @@ class Agent:
 
     # -- contract ----------------------------------------------------------
     def reset(self, session_id: str, user_profile: dict) -> None:
+        """Start a new session. Part of the official contract."""
         self._sessions[session_id] = DialogueState(session_id, user_profile or {})
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        """One conversational turn: interpret, rank, then decide whether to speak.
+
+        Part of the official contract; returns `message`, `ask_attribute` and
+        `recommendations`. `recommendations` is deliberately empty when the
+        policy judges the evidence too weak — a session ends at the first hit,
+        so showing the target at rank 8 locks that rank in forever."""
         state = self._sessions.get(session_id)
         if state is None:                      # defensive: harness may skip reset
             self.reset(session_id, {})

@@ -116,6 +116,7 @@ class Span:
 
     @property
     def key(self) -> str:
+        """Canonical identity of the span, used to deduplicate against held slots."""
         return " ".join(self.tokens)
 
 
@@ -256,6 +257,8 @@ def _salient_runs(
 ) -> list[list[str]]:
     """Contiguous runs of informative, unseen tokens, bridging small gaps."""
     def salient(term: str) -> bool:
+        """Could this token be part of a requirement? Rejects dialogue filler,
+        tokens no product uses, and words too common to narrow anything."""
         if term in DIALOGUE_STOP or len(term) < 2:
             return False
         if not index.informative(term, cfg.max_token_df_ratio):
