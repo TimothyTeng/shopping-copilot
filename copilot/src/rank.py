@@ -22,7 +22,10 @@ from .state import DialogueState, Slot
 
 class Ranker:
     def __init__(self, store: CatalogStore, index: InvertedIndex, cfg,
-                 bm25=None) -> None:
+                 bm25=None, assoc=None, d2q=None, dense=None) -> None:
+        self.assoc = assoc        # mined term associations; None unless enabled
+        self.d2q = d2q            # BM25 over generated shopper queries, or None
+        self.dense = dense        # bi-encoder vectors, or None
         self.store = store
         self.index = index
         self.cfg = cfg
@@ -79,6 +82,68 @@ class Ranker:
             picked += [d for _, _, d in scored[cfg.mmr_pool:]][: top_k - len(picked)]
         return picked[:top_k]
 
+    def _card_bonus(self, doc: int, disclosed: set[str]) -> float:
+        """How many disclosed constraints are slots of *this product's own card*.
+
+        Coverage asks "does this document contain the words". This asks the
+        sharper question the simulator's own construction allows: "would this
+        product have produced that constraint string in the first place?" The
+        constraints are `intent_card` slots of the target, and `catalog.card`
+        mirrors that function exactly, so the target matches every disclosed
+        constraint BY CONSTRUCTION — the bonus can raise a tie-mate above the
+        target only if that mate would have generated the identical card slot,
+        which is the definition of indistinguishable.
+
+        Measured before building (docs/algorithm-audit.md §2.5): of the 24
+        sessions not at rank 1, this clears every product above the target in 11
+        and some of them in 13 more, and it demotes the target in none.
+        """
+        if not disclosed:
+            return 0.0
+        card = self.store.card[doc]
+        return float(sum(1 for value in disclosed if value in card))
+
+    def _cluster_rerank(self, scored: list[tuple[float, float, int]],
+                        top_k: int) -> list[int]:
+        """Round-robin the head over near-duplicate clusters.
+
+        The parameter-free sibling of `_mmr_rerank`, and the same hypothesis
+        stated as a model rather than as a trade-off: the conjunctive score is a
+        biased estimate of P(this is the target), because a family of
+        near-identical listings splits the probability mass that one product
+        deserves. Grouping the family and taking one member before any second
+        member spends the top-10 on distinct products instead of on one family.
+
+        No lambda: the relevance/diversity trade MMR tunes is replaced by a
+        single equivalence threshold, and ordering within and across clusters is
+        pure relevance. Like MMR it cannot demote the leader — the first cluster
+        emitted is the leader's.
+        """
+        pool = scored[: self.cfg.mmr_pool]
+        if len(pool) <= 1:
+            return [d for _, _, d in scored[:top_k]]
+        threshold = self.cfg.cluster_threshold
+        clusters: list[list[int]] = []          # each best-first, by construction
+        for _total, _prior, doc in pool:
+            for members in clusters:
+                if self._similarity(doc, members[0]) >= threshold:
+                    members.append(doc)
+                    break
+            else:
+                clusters.append([doc])
+        picked: list[int] = []
+        depth = 0
+        while len(picked) < top_k and any(len(c) > depth for c in clusters):
+            for members in clusters:
+                if len(members) > depth:
+                    picked.append(members[depth])
+                    if len(picked) >= top_k:
+                        break
+            depth += 1
+        if len(picked) < top_k:
+            picked += [d for _, _, d in scored[self.cfg.mmr_pool:]][: top_k - len(picked)]
+        return picked[:top_k]
+
     def _coverage(self, slot: Slot) -> dict[int, float]:
         """doc -> IDF mass of this slot's tokens present in that doc."""
         acc: dict[int, float] = {}
@@ -88,6 +153,24 @@ class Ranker:
             for doc in self.index.docs_for(term):
                 acc[doc] = acc.get(doc, 0.0) + weight
         return acc
+
+    def _profile_affinity(self, state: DialogueState) -> float | None:
+        """The rating the shopper's history says they end up buying.
+
+        `user_profile` is handed to `reset()` on every session and has never
+        been read. Measured on the public set: corr(average_prior_rating,
+        the target's own average_rating) = +0.182, and targets sit above the
+        catalog mean (4.37 vs 4.09). Weak, but it is free signal, and it lands
+        exactly where the remaining benchmark points are — inside tied groups
+        the constraints cannot separate.
+        """
+        if not self.cfg.profile_affinity:
+            return None
+        value = (state.profile or {}).get("average_prior_rating")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _prior(self, doc: int) -> float:
         """Query-independent evidence for a product the constraints cannot rank.
@@ -152,11 +235,65 @@ class Ranker:
         """Rank by BM25 over everything the shopper actually said."""
         if self.bm25 is None:
             return []
+        cfg = self.cfg
         query = state.transcript()
-        if self.cfg.bm25_drop_stopwords:
+        if cfg.bm25_drop_stopwords:
             query = " ".join(t for t in tokens(query) if t not in DIALOGUE_STOP)
-        return [doc for doc, _ in
-                self.bm25.score(query, self.cfg, self.cfg.rrf_depth)]
+        if cfg.rm3:
+            base = [doc for doc, _ in self.bm25.rm3(query, cfg, cfg.rrf_depth)]
+        elif self.assoc is not None:
+            base = [doc for doc, _ in
+                    self.bm25.expanded(query, cfg, cfg.rrf_depth, self.assoc)]
+        else:
+            base = [doc for doc, _ in self.bm25.score(query, cfg, cfg.rrf_depth)]
+
+        if self.d2q is not None:
+            # A second opinion in the shopper's own register. Fused, not merged:
+            # the two rankings are on incomparable scales and RRF reads only
+            # positions, so the generated side can add a candidate but cannot
+            # dilute the shopper's rare words (the `union` failure, recorded in
+            # config.hyde_bm25_mode).
+            base = self._fuse(
+                [base, [doc for doc, _ in self.d2q.score(query, cfg, cfg.rrf_depth)]],
+                cfg.rrf_k,
+                [1.0 - cfg.doc2query_weight, cfg.doc2query_weight],
+            )
+
+        if self.dense is not None and cfg.dense_weight > 0.0:
+            # The third opinion, and the only one that is not lexical at all.
+            # Same instrument and the same argument as doc2query above: dense
+            # loses to BM25 as a sole retriever and beats it fused, because the
+            # two miss different documents. RRF is what lets a cosine and a
+            # BM25 sum be combined without inventing a scale between them.
+            dense = [doc for doc, _ in
+                     self.dense.score(query, cfg, cfg.dense_depth)]
+            if dense:
+                base = self._fuse([base, dense], cfg.rrf_k,
+                                  [1.0 - cfg.dense_weight, cfg.dense_weight])
+
+        mode = cfg.hyde_bm25_mode
+        if not state.hyde_text or mode == "off":
+            return base
+        if mode == "union":
+            # MEASURED AND REJECTED as the default. Pouring the generated terms
+            # into one query dilutes it: generic listing vocabulary ("soft",
+            # "durable", "comfortable") outvotes the shopper's own words and
+            # pulls in the wrong products. Stress hit@10 0.846 -> 0.769, losing
+            # two targets outright, while MRR rose 0.305 -> 0.397. The signal was
+            # real and the delivery was wrong. Kept as a switch.
+            return [doc for doc, _ in
+                    self.bm25.score(f"{query} {state.hyde_text}", cfg, cfg.rrf_depth)]
+        # `fuse` — keep the transcript ranking intact and let the generated
+        # listing contribute a SECOND opinion. Fusion is the right instrument
+        # because a fused list contains the union of both inputs, so the
+        # generation can only add recall, never spend it. RRF also reads
+        # positions only, which matters here: the two queries are on
+        # incomparable scales (one is the shopper, one is a fabrication).
+        return self._fuse(
+            [base, list(state.hyde_ranking)],
+            cfg.rrf_k,
+            [1.0 - cfg.hyde_rrf_weight, cfg.hyde_rrf_weight],
+        )
 
     @staticmethod
     def _fuse(rankings: list[list[int]], k: float,
@@ -206,6 +343,13 @@ class Ranker:
                 raw[doc] = raw.get(doc, 0.0) + w * mass
         for doc in category:
             raw[doc] = raw.get(doc, 0.0) + 0.5
+        # The generated listing contributes CANDIDATES, not just an ordering.
+        # Half the natural-language loss is recall (stress hit@10 0.500), and a
+        # product the constraints never reached cannot be rescued by reranking.
+        hyde = frozenset(state.hyde_ranking)
+        if hyde:
+            for doc in hyde:
+                raw[doc] = raw.get(doc, 0.0) + cfg.hyde_prefilter_mass
         if not raw:
             return [], 0
 
@@ -217,11 +361,22 @@ class Ranker:
 
         scored: list[tuple[float, float, int]] = []
         satisfied = 0
+        floor = cfg.slot_cover_floor
+        affinity = self._profile_affinity(state)
         for doc in candidates:
             total = 0.0
             full = True
             for acc, slot in coverages:
                 cover = acc.get(doc, 0.0) / slot.idf_total
+                if floor < 1.0:
+                    # A slot is "met" once it covers `slot_cover_floor` of its own
+                    # IDF mass, not all of it. `_salient_runs` bridges connectors
+                    # into a span ("rubber sole plus design"), and `_coverage`
+                    # then requires every token of it — so a glue word becomes a
+                    # mandatory conjunction term. Charging only for the mass that
+                    # matters lets the requirement survive its own connective
+                    # tissue. Exactly 1.0 restores the original hard behaviour.
+                    cover = min(1.0, cover / floor)
                 if cover < 0.999:
                     full = False
                 total += slot.weight * math.log(cfg.log_epsilon + cover ** cfg.coverage_gamma)
@@ -229,9 +384,21 @@ class Ranker:
                 satisfied += 1
             if doc in category_set:
                 total += category_bonus
+            if hyde and doc in hyde:
+                # Additive, exactly like the category bonus. Deliberately NOT a
+                # slot: a generated term inside the conjunction would have to be
+                # satisfied by every candidate, and one bad guess would empty the
+                # pool — the documented "constraints only accumulate" failure.
+                # As a bonus, a bad generation costs precision and nothing else.
+                total += cfg.hyde_bonus
             if doc in shown:
                 total -= cfg.shown_penalty
             prior = self._prior(doc)
+            if affinity is not None:
+                # Closer to the shopper's habitual rating is better; the weight
+                # keeps this strictly a tie-break, never a ranking signal.
+                prior -= self.cfg.profile_affinity_weight * abs(
+                    self.store.rating_avg[doc] - affinity)
             scored.append((total, prior, doc))
 
         scored.sort(key=lambda row: (-row[0], -row[1]))
@@ -239,12 +406,15 @@ class Ranker:
         # Rescore only the head, where ordering actually decides the outcome.
         head = scored[: cfg.phrase_verify_top]
         phrases = [s.phrase for _, s in coverages if s.phrase]
+        disclosed = state.disclosed if cfg.card_signature else set()
         if head:
             rescored: list[tuple[float, float, int]] = []
             for total, prior, doc in head:
                 bonus = sum(
                     cfg.phrase_bonus for phrase in phrases if self.store.contains(doc, phrase)
                 )
+                if disclosed:
+                    bonus += cfg.card_bonus * self._card_bonus(doc, disclosed)
                 if cfg.bm25f_weight:
                     bonus += cfg.bm25f_weight * self._bm25f(doc, coverages)
                 rescored.append((total + bonus, prior, doc))
@@ -272,6 +442,8 @@ class Ranker:
         if mode == "conjunctive":
             if cfg.tie_rerank == "mmr":
                 return self._mmr_rerank(scored, top_k), satisfied
+            if cfg.tie_rerank == "cluster":
+                return self._cluster_rerank(scored, top_k), satisfied
             return conjunctive[:top_k], satisfied
         if mode == "bm25":
             ordered = self._bm25_ranking(state) or conjunctive

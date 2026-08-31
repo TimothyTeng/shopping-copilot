@@ -58,6 +58,35 @@ _RESET = re.compile(
     r"forget (?:it|everything|all that))\b",
     re.I,
 )
+# The simulator quotes its constraint strings verbatim after a fixed colon
+# carrier — "A key requirement is: X.", "For that, what matters is: X; Y.",
+# "What I need is: X." Those strings are `_clean_constraint`ed slots of the
+# target's own intent card, so recovering them exactly (rather than mining them
+# for tokens) lets the ranker ask whether a *candidate* would have produced the
+# same card. See catalog.card_slots and rank._card_bonus.
+_DISCLOSURE = re.compile(
+    r"(?:key requirement is|requirement is|what matters is|what i need is|need is)\s*:\s*(.+)$",
+    re.I | re.S,
+)
+
+
+def disclosed_constraints(message: str) -> list[str]:
+    """The raw constraint strings this message discloses, normalized.
+
+    Empty for any message that does not use the simulator's colon carrier, which
+    is every free-text message — so this is inert outside the graded path.
+    """
+    match = _DISCLOSURE.search(message)
+    if not match:
+        return []
+    out: list[str] = []
+    for piece in match.group(1).split(";"):
+        value = norm(piece.strip().rstrip("."))
+        if value:
+            out.append(value)
+    return out
+
+
 _NO_PREF = re.compile(
     r"\b(?:no preference|don'?t have a preference|no strong (?:feelings|preference)|"
     r"doesn'?t matter|your (?:call|judgment)|up to you)\b",

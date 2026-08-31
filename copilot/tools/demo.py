@@ -69,7 +69,7 @@ def cmd_replay(args) -> None:
         pool = samples
     sample = random.Random(args.seed).choice(pool)
 
-    agent = build(retrieval=args.retrieval)
+    agent = build(retrieval=args.retrieval, backend=args.backend)
     store = agent.store
     renderer = RENDERERS[args.level]()
 
@@ -193,9 +193,16 @@ def cmd_chat(args) -> None:
     # Fuzzy repair is on here for the same reason: a person types `waterprrof`,
     # the simulator never does. It is a no-op on any token the catalog contains,
     # so it can only help this surface and cannot regress the graded path.
+    # doc2query for the same reason again, and it is the largest gain this
+    # surface has ever had: +0.0507 on the n=427 prose set, 95% CI
+    # [+0.0286, +0.0729]. Inert on the graded path (conjunctive never calls the
+    # prose retriever) and network-free, because the generation was paid for at
+    # build time.
     agent = Agent(config.CATALOG_PATH,
                   config.DEFAULT.replace(gate_enabled=False,
                                          fuzzy_repair=True,
+                                         doc2query_expansions=True,
+                                         backend=args.backend,
                                          retrieval=args.retrieval))
     print(f"{DIM}ready{RESET}\n")
     store = agent.store
@@ -243,6 +250,12 @@ def main() -> None:
     chat.add_argument("--retrieval", default="bm25",
                       choices=["conjunctive", "bm25", "rrf", "auto"])
     chat.set_defaults(func=cmd_chat)
+
+    # The optional model tier (src/backends/). Off unless asked for, on either
+    # surface, so neither demo opens a socket by default.
+    for parser_ in (replay, chat):
+        parser_.add_argument("--backend", default="null", choices=["null", "hyde"],
+                             help="optional model tier (default: null)")
 
     args = parser.parse_args()
     args.func(args)

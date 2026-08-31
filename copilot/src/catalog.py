@@ -7,6 +7,7 @@ are drawn from that same rendering. Any divergence here breaks phrase grounding.
 from __future__ import annotations
 
 import json
+import re
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,71 @@ def parse_price(value: object) -> float:
     return float("nan")
 
 
+# --- intent-card mirror ---------------------------------------------------
+# The simulator does not invent the shopper's requirements: it *derives* them
+# from the target product, deterministically, in `local_evaluator.intent_card`.
+# The public set ships no `intent_card`, so `materialize_hidden_fields` rebuilds
+# one from the catalog at scoring time — which means every product's four
+# possible constraint strings are computable offline, here.
+#
+# This mirrors that function exactly, the same way `coarse_category` and
+# `searchable_text` do. If it diverges, the signature silently stops matching
+# and the bonus becomes a no-op — a degradation, never a wrong answer.
+_MATERIAL_RE = re.compile(
+    r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b", re.I)
+_COLOR_RE = re.compile(
+    r"\b(black|white|blue|red|pink|green|brown|gray|grey|purple|yellow|orange)\b", re.I)
+_WS_RE = re.compile(r"\s+")
+
+CARD_LIMIT = 180        # local_evaluator.intent_card's default `limit`
+CARD_SLOTS = 4          # hard_constraints[:2] + soft_preferences[2:4]
+
+
+def clean_constraint(value: str, limit: int = CARD_LIMIT) -> str:
+    """Mirror of `local_evaluator._clean_constraint`."""
+    return _WS_RE.sub(" ", value).strip(" -;,.\t\n")[:limit].rstrip()
+
+
+def card_values(value: object) -> list[str]:
+    """Mirror of `local_evaluator._flatten_values`.
+
+    Note this is NOT `flatten`: the card renders a dict as "key: item", while the
+    searchable text renders it as "key item". Two different renderings of the
+    same field, and the constraint strings come from this one.
+    """
+    if isinstance(value, dict):
+        return [f"{key}: {item}" for key, item in value.items()
+                if item not in (None, "", [])]
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)] if value not in (None, "") else []
+
+
+def card_slots(product: dict) -> list[str]:
+    """The constraint strings the simulator can draw from this product.
+
+    `intent_card` takes `cleaned[:2]` as hard constraints and `cleaned[2:4]` as
+    soft preferences, so the first four are everything a session can disclose.
+    """
+    candidates = [*card_values(product.get("features")),
+                  *card_values(product.get("details"))]
+    corpus = searchable_text(product)
+    material = _MATERIAL_RE.search(corpus)
+    color = _COLOR_RE.search(corpus)
+    if material:
+        candidates.insert(0, material.group(1).lower())
+    if color:
+        candidates.insert(1, f"color: {color.group(1).lower()}")
+    if product.get("price") not in (None, ""):
+        candidates.append(f"budget around ${product['price']}")
+    cleaned = list(dict.fromkeys(
+        clean_constraint(item) for item in candidates if clean_constraint(item)
+    ))
+    if not cleaned:
+        cleaned = [clean_constraint(str(product.get("title") or "product"))]
+    return cleaned[:CARD_SLOTS]
+
+
 def coarse_category(values: list[str]) -> str:
     """Mirror of the evaluator's coarse_category, used to key category buckets."""
     cleaned: list[str] = []
@@ -75,6 +141,7 @@ class CatalogStore:
     raw_title: list[str]      # original title, for display
     category: list[str]       # normalized category path
     cat_path: list[list[str]]  # raw breadcrumb segments
+    card: list[frozenset[str]]  # normalized intent-card slots (see card_slots)
     rating_n: array
     rating_avg: array
     price: array
@@ -101,6 +168,7 @@ class CatalogStore:
         raw_title: list[str] = []
         category: list[str] = []
         cat_path: list[list[str]] = []
+        card: list[frozenset[str]] = []
         rating_n = array("i")
         rating_avg = array("f")
         price = array("f")
@@ -120,6 +188,9 @@ class CatalogStore:
                 segments = [str(v) for v in (product.get("categories") or [])]
                 cat_path.append(segments)
                 category.append(norm(" ".join(segments)))
+                # Normalized on both sides so a punctuation difference between
+                # the message and the stored slot cannot break the match.
+                card.append(frozenset(norm(slot) for slot in card_slots(product)))
                 n_all = len(tokens(text[-1]))
                 n_ttl = len(tokens(title[-1]))
                 n_cat = len(tokens(category[-1]))
@@ -138,6 +209,7 @@ class CatalogStore:
             raw_title=raw_title,
             category=category,
             cat_path=cat_path,
+            card=card,
             rating_n=rating_n,
             rating_avg=rating_avg,
             price=price,
