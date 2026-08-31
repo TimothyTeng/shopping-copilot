@@ -40,6 +40,7 @@ OFFICIAL = ROOT / "results" / "official.json"
 
 
 def run(label: str, argv: list[str]) -> bool:
+    """Run one sub-check as a subprocess and report whether it passed."""
     print(f"\n=== {label} ===", flush=True)
     return subprocess.run(argv, cwd=ROOT).returncode == 0
 
@@ -86,6 +87,9 @@ def score_is_expected() -> bool:
 
 
 def main() -> int:
+    """Run the three invariants together and exit non-zero on any failure:
+    the kit is untouched, the mirrored functions still agree, and the official
+    score still matches the number this tree is documented at."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fast", action="store_true",
                         help="sample the mirrors and skip the harness")

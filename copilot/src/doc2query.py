@@ -35,6 +35,8 @@ class Doc2QueryIndex:
     __slots__ = ("docs", "freqs", "lengths", "n_docs", "avg_len", "_idf", "covered")
 
     def __init__(self, store: CatalogStore, expansions: dict[str, list[str]]) -> None:
+        """Index the generated queries against the store's own doc ordinals, so
+        this signal fuses with the lexical one without a second id mapping."""
         self.n_docs = len(store)
         docs: dict[str, array] = {}
         freqs: dict[str, array] = {}
@@ -95,6 +97,8 @@ class Doc2QueryIndex:
         return cls(store, expansions)
 
     def idf(self, term: str) -> float:
+        """IDF over the generated-query corpus, not the catalog text — a term is
+        rare here if few products would be *asked for* with that word."""
         cached = self._idf.get(term)
         if cached is None:
             import math
@@ -104,6 +108,7 @@ class Doc2QueryIndex:
         return cached
 
     def score(self, query: str, cfg, limit: int) -> list[tuple[int, float]]:
+        """BM25 the shopper's words against what a shopper would have typed."""
         k1, b = cfg.bm25_k1, cfg.bm25_b
         max_df = self.n_docs * cfg.max_token_df_ratio
         scores: dict[int, float] = {}

@@ -21,6 +21,10 @@ class CategoryIndex:
                  "_doc_prefix", "doc_key")
 
     def __init__(self, store: CatalogStore) -> None:
+        """Index every product under its coarse bucket and each ancestor prefix.
+
+        The prefixes are what makes widening possible: if the leaf bucket is too
+        narrow or was resolved wrongly, the parent path still holds candidates."""
         buckets: dict[str, list[int]] = defaultdict(list)
         prefixes: dict[tuple[str, ...], list[int]] = defaultdict(list)
         doc_prefix: list[tuple[str, ...]] = []

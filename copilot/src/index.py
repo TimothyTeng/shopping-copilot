@@ -34,10 +34,16 @@ class InvertedIndex:
 
     # -- term statistics ---------------------------------------------------
     def df(self, term: str) -> int:
+        """How many products contain `term`. 0 if the token is not in the catalog
+        — which is how a shopper word that no product uses is detected."""
         posting = self.postings.get(term)
         return len(posting) if posting is not None else 0
 
     def idf(self, term: str) -> float:
+        """BM25 probabilistic IDF, memoised: how much evidence one token carries.
+
+        Every coverage score in `rank.py` is a ratio of these, so a rare token
+        dominates a common one rather than counting as one match of many."""
         cached = self._idf.get(term)
         if cached is None:
             df = self.df(term)
@@ -46,6 +52,7 @@ class InvertedIndex:
         return cached
 
     def docs_for(self, term: str) -> array:
+        """Sorted document ordinals containing `term`; an empty array if unseen."""
         return self.postings.get(term, array("i"))
 
     # -- phrase verification ----------------------------------------------
@@ -67,8 +74,12 @@ class InvertedIndex:
         return result
 
     def phrase_df(self, phrase: str) -> int:
+        """How many products contain `phrase` contiguously (verified, not indexed)."""
         return len(self.phrase_docs(phrase))
 
     def informative(self, term: str, max_df_ratio: float) -> bool:
+        """True when a term is present in the catalog but not so common it says
+        nothing. Both halves matter: df==0 cannot narrow anything, and a token in
+        a third of the catalog ("women") is category noise, not a requirement."""
         df = self.df(term)
         return 0 < df <= self.n_docs * max_df_ratio

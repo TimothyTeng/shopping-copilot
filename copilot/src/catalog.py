@@ -33,6 +33,11 @@ def flatten(value: object) -> list[str]:
 
 
 def searchable_text(product: dict) -> str:
+    """Flatten a product exactly the way the evaluator does.
+
+    MIRRORS THE KIT. The hidden constraints are drawn from this same rendering,
+    so any divergence stops matching silently — `tools/verify_mirror.py`
+    compares all 50,000 products against the kit's own function."""
     parts: list[str] = []
     for field in SEARCH_FIELDS:
         parts.extend(flatten(product.get(field)))
@@ -154,6 +159,7 @@ class CatalogStore:
     avg_body: float
 
     def __len__(self) -> int:
+        """Number of products in the catalog."""
         return len(self.ids)
 
     def contains(self, doc: int, phrase: str) -> bool:
@@ -162,6 +168,10 @@ class CatalogStore:
 
     @classmethod
     def load(cls, path: str | Path) -> "CatalogStore":
+        """Read the catalog once into parallel arrays keyed by document ordinal.
+
+        Columnar rather than a list of dicts: the ranker touches one field at a
+        time over many documents, and arrays keep the whole store near 90 MB."""
         ids: list[str] = []
         text: list[str] = []
         title: list[str] = []

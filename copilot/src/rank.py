@@ -21,8 +21,16 @@ from .state import DialogueState, Slot
 
 
 class Ranker:
+    """Turns dialogue state into an ordered top-k.
+
+    Everything optional (BM25, associations, doc2query, dense vectors) arrives
+    as a constructor argument that may be None, so the default graded path is
+    the stdlib conjunctive scorer and nothing else.
+    """
+
     def __init__(self, store: CatalogStore, index: InvertedIndex, cfg,
                  bm25=None, assoc=None, d2q=None, dense=None) -> None:
+        """Wire in whichever signals the config actually asked for."""
         self.assoc = assoc        # mined term associations; None unless enabled
         self.d2q = d2q            # BM25 over generated shopper queries, or None
         self.dense = dense        # bi-encoder vectors, or None
@@ -33,6 +41,8 @@ class Ranker:
         self._title_toks: dict[int, frozenset[str]] = {}   # lazy, for MMR only
 
     def _title_set(self, doc: int) -> frozenset[str]:
+        """Memoised title tokens. Only MMR needs these, so they are built lazily
+        rather than for all 50,000 products up front."""
         cached = self._title_toks.get(doc)
         if cached is None:
             cached = frozenset(tokens(self.store.title[doc]))
@@ -210,6 +220,7 @@ class Ranker:
         tf_all = Counter(tokens(s.text[doc]))
 
         def norm_len(length: int, avg: float) -> float:
+            """BM25 length normalisation: how much to discount a long field."""
             return 1.0 - cfg.b_norm + cfg.b_norm * (length / avg if avg else 1.0)
 
         d_title = norm_len(s.len_title[doc], s.avg_title)

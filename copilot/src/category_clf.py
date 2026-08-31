@@ -25,9 +25,14 @@ DEFAULT_PATH = Path(__file__).resolve().parent / "models" / "category_clf.json.g
 
 
 class CategoryClassifier:
+    """Trained bucket classifier, loaded from a shipped gzip table.
+
+    Off the graded path: `category_resolver` selects it, and the default is
+    the substring bucket match, which survives rephrasing better."""
     __slots__ = ("lo", "hi", "classes", "intercept", "postings")
 
     def __init__(self, path: str | Path = DEFAULT_PATH) -> None:
+        """Load the model: class list, intercepts, and ngram -> (class, weight)."""
         with gzip.open(path, "rt", encoding="utf-8") as fh:
             model = json.load(fh)
         self.lo = model["lo"]

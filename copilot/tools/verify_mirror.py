@@ -37,6 +37,8 @@ from src import catalog, config  # noqa: E402
 
 
 def main() -> int:
+    """Compare our mirrored evaluator functions against the kit's own, over all
+    50,000 products. They fail silently on divergence, so this is the guard."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-n", "--limit", type=int, default=0,
                         help="products to check; 0 = the whole catalog")

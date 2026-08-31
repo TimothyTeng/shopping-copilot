@@ -38,6 +38,10 @@ from src.agent import Agent  # noqa: E402
 
 
 def composite(summary: dict) -> tuple[float, float]:
+    """The official composite from a metric summary: returns (score, efficiency).
+
+    0.50*Hit@10 + 0.30*MRR + 0.20*Efficiency, Efficiency = (11-MTTC)/10 clipped.
+    A miss counts as turn 11, which is why rank is worth ~13x a turn here."""
     efficiency = max(0.0, min(1.0, (11.0 - float(summary["mttc"])) / 10.0))
     score = (
         0.50 * summary["hit_rate_at_10"]
@@ -48,6 +52,7 @@ def composite(summary: dict) -> tuple[float, float]:
 
 
 def show(label: str, sessions: list[dict]) -> dict:
+    """Print the overall line plus a per-scenario breakdown; return the totals."""
     overall = metric_summary(sessions)
     score, efficiency = composite(overall)
     print(f"\n{label}")
@@ -65,6 +70,8 @@ def show(label: str, sessions: list[dict]) -> dict:
 
 
 def load_world():
+    """Load the kit's public set and catalog. Read-only: the official files are
+    never written, and `evaluate()` takes our agent as an argument."""
     samples = load_jsonl(KIT_ROOT / "data" / "public_set.jsonl")
     ids, categories, products = catalog_index(KIT_ROOT / "data" / "catalog.jsonl")
     return samples, ids, categories, products
@@ -92,6 +99,10 @@ def _coerce(field: str, value: str):
 
 
 def build_agent(**overrides) -> Agent:
+    """Construct an agent with CLI flags and `--set` overrides folded in.
+
+    Every experiment in this project is a `Settings` override rather than a
+    code change, which is what lets the harness sweep configs in one process."""
     if RETRIEVAL is not None:
         overrides.setdefault("retrieval", RETRIEVAL)
     if RESOLVER is not None:
@@ -111,6 +122,7 @@ def build_agent(**overrides) -> Agent:
 
 
 def cmd_run(args) -> None:
+    """`harness run` — the official score on the 200-session public set."""
     samples, ids, categories, products = load_world()
     agent = build_agent()
     started = time.perf_counter()
@@ -193,6 +205,8 @@ def cmd_ci(args) -> None:
 
 
 def cmd_ablate(args) -> None:
+    """`harness ablate` — re-score with each design decision switched off,
+    one at a time, and print the delta each one is worth."""
     samples, ids, categories, products = load_world()
     switches = {
         "baseline": {},
@@ -220,6 +234,7 @@ def cmd_ablate(args) -> None:
 
 
 def main() -> None:
+    """CLI entry point: run | perturb | ablate | ci."""
     parser = argparse.ArgumentParser(description="TechJam agent harness")
     sub = parser.add_subparsers(dest="cmd", required=True)
     common = argparse.ArgumentParser(add_help=False)

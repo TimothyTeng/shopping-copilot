@@ -36,10 +36,13 @@ class Vectors:
     turn: list[int]
 
     def __len__(self) -> int:
+        """Number of sessions carried."""
         return len(self.hit)
 
 
 def to_vectors(sessions: list[dict]) -> Vectors:
+    """Reduce sessions to the per-session hit/reciprocal-rank/turn vectors the
+    resampler needs, so a resample is an index draw rather than a re-scoring."""
     return Vectors(
         hit=[int(s["hit"]) for s in sessions],
         rr=[float(s["reciprocal_rank"]) for s in sessions],

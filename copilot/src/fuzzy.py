@@ -85,6 +85,7 @@ class FuzzyRepair:
     __slots__ = ("index", "cfg", "terms", "tri")
 
     def __init__(self, index: InvertedIndex, cfg) -> None:
+        """Build the trigram index of candidate correction targets."""
         self.index = index
         self.cfg = cfg
         # The pool of words a typo may map TO: alpha, long enough to be worth
@@ -143,6 +144,7 @@ class FuzzyRepair:
         word spans are rewritten, never the glue between them.
         """
         def sub(match: re.Match) -> str:
+            """Rewrite one word in place, leaving its original case if unchanged."""
             word = match.group(0)
             repaired = self._repair_token(word.lower())
             return repaired if repaired != word.lower() else word

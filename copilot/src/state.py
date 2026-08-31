@@ -22,6 +22,8 @@ from .index import InvertedIndex
 
 
 class Provenance:
+    """Where a slot came from. This is what makes an override *scoped*: only
+    OPENING_FREEFORM is revoked, because only that was replaced."""
     OPENING_REQUIREMENT = "opening_requirement"   # a stated hard requirement
     OPENING_FREEFORM = "opening_freeform"         # the preference an override replaces
     ASK_REPLY = "ask_reply"
@@ -30,6 +32,8 @@ class Provenance:
 
 @dataclass(slots=True)
 class Slot:
+    """One accumulated constraint: its tokens, their IDF weights, the contiguous
+    phrase it came from if any, and enough provenance to revoke it later."""
     tokens: tuple[str, ...]
     idfs: tuple[float, ...]
     phrase: str | None
@@ -41,15 +45,23 @@ class Slot:
 
     @property
     def idf_total(self) -> float:
+        """Total IDF mass of this slot — the denominator of its coverage ratio.
+        Floored at 1.0 so an all-stopword slot cannot divide by zero."""
         return sum(self.idfs) or 1.0
 
     @property
     def key(self) -> str:
+        """Canonical identity, used to deduplicate repeats of the same constraint."""
         return " ".join(self.tokens)
 
 
 @dataclass
 class DialogueState:
+    """Everything remembered about one shopper session.
+
+    Constructed per `session_id` by `Agent.reset` and mutated in place by
+    `Agent._observe`. Slots only ever accumulate or get revoked; nothing here
+    is rebuilt from scratch mid-session."""
     session_id: str
     profile: dict
     turn: int = 0
@@ -107,6 +119,12 @@ class DialogueState:
 
     def add_spans(self, spans: list[Span], index: InvertedIndex, provenance: str,
                   cfg=None) -> int:
+        """Add newly extracted spans as slots, skipping ones already held.
+
+        Deduplication is by `Slot.key`, so the shopper repeating a requirement
+        in different words costs nothing. Returns how many were genuinely new,
+        which is what `policy` reads to decide whether the turn made progress.
+        """
         added = 0
         existing = {slot.key for slot in self.slots}
         for span in spans:
@@ -128,6 +146,8 @@ class DialogueState:
         return added
 
     def active_slots(self) -> list[Slot]:
+        """Slots still in force: not revoked by an override or a retraction, and
+        not zeroed by specificity weighting. This is the conjunction we rank on."""
         return [s for s in self.slots if s.status == "active" and s.weight > 0]
 
     def retract(self, phrases: list[str]) -> int:

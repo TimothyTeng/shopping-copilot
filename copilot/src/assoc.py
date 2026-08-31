@@ -24,10 +24,13 @@ class Associations:
     __slots__ = ("table",)
 
     def __init__(self, table: dict[str, list]) -> None:
+        """Wrap a mined PPMI table (built offline by `tools/train_assoc.py`)."""
         self.table = table
 
     @classmethod
     def try_load(cls, path: Path = MODEL_PATH) -> "Associations | None":
+        """Load the shipped table, or None if it was never built. Callers must
+        handle None: the table is optional and `assoc_expand` is off by default."""
         try:
             with gzip.open(path, "rt", encoding="utf-8") as handle:
                 return cls(json.load(handle))
@@ -35,6 +38,7 @@ class Associations:
             return None
 
     def neighbours(self, term: str, limit: int) -> list[tuple[str, float]]:
+        """The `limit` catalog terms most associated with `term`, strongest first."""
         row = self.table.get(term)
         if not row:
             return []

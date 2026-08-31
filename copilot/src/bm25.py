@@ -33,6 +33,8 @@ class Bm25Index:
     __slots__ = ("docs", "freqs", "lengths", "n_docs", "avg_len", "_idf", "_store")
 
     def __init__(self, store: CatalogStore) -> None:
+        """Build term-frequency postings. ~2x the cost of the unigram index, so
+        the agent only constructs this when a prose mode or resolver reads it."""
         self._store = store          # feedback terms are read back off the text
         self.n_docs = len(store)
         docs: dict[str, array] = {}
@@ -55,10 +57,12 @@ class Bm25Index:
         self._idf: dict[str, float] = {}
 
     def df(self, term: str) -> int:
+        """Document frequency of `term` in the BM25 postings."""
         posting = self.docs.get(term)
         return len(posting) if posting is not None else 0
 
     def idf(self, term: str) -> float:
+        """BM25 probabilistic IDF, memoised (same form as `index.idf`)."""
         cached = self._idf.get(term)
         if cached is None:
             df = self.df(term)
