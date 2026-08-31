@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import config, extract, policy
+from . import backends, config, extract, policy
 from .bm25 import Bm25Index
+from .normalize import DIALOGUE_STOP, norm, tokens
 from .catalog import CatalogStore
 from .category import CategoryIndex
 from .index import InvertedIndex
@@ -32,7 +33,9 @@ class Agent:
         # Only pay for the term-frequency index if a mode actually reads it —
         # a prose retrieval mode, or a category resolver that falls back to vote.
         needs_bm25 = (self.cfg.retrieval in ("bm25", "rrf", "auto")
-                      or self.cfg.category_resolver in ("vote", "classifier", "ensemble"))
+                      or self.cfg.category_resolver in ("vote", "classifier", "ensemble")
+                      # the model tier retrieves with its generated listing
+                      or self.cfg.backend not in (None, "", "null", "none"))
         self.bm25 = Bm25Index(self.store) if needs_bm25 else None
         self.classifier = None
         if self.cfg.category_resolver in ("classifier", "ensemble"):
@@ -45,7 +48,29 @@ class Agent:
         if self.cfg.fuzzy_repair:
             from .fuzzy import FuzzyRepair
             self.fuzzy = FuzzyRepair(self.index, self.cfg)
-        self.ranker = Ranker(self.store, self.index, self.cfg, self.bm25)
+        # Mined term associations: the vocabulary bridge, as a shipped table.
+        self.assoc = None
+        if self.cfg.assoc_expand:
+            from .assoc import Associations
+            self.assoc = Associations.try_load()
+        # Offline catalog expansion: what a shopper would have typed to find
+        # each product. Built at training time, read here as a plain index.
+        self.d2q = None
+        if self.cfg.doc2query_expansions:
+            from .doc2query import Doc2QueryIndex
+            self.d2q = Doc2QueryIndex.try_load(self.store)
+        # Semantic vectors: the one signal in the pipeline that is not lexical.
+        # Needs torch in-process to embed the query, so it is prose-surface only
+        # and never part of the graded, stdlib-only agent.
+        self.dense = None
+        if self.cfg.dense_weight > 0.0:
+            from .dense import DenseIndex
+            self.dense = DenseIndex.try_load(self.store)
+        self.ranker = Ranker(self.store, self.index, self.cfg, self.bm25,
+                             self.assoc, self.d2q, self.dense)
+        # The optional model tier. `None` unless explicitly configured, so the
+        # default agent constructs no client and opens no socket.
+        self.backend = backends.build(self.cfg)
         self._sessions: dict[str, DialogueState] = {}
 
     # -- contract ----------------------------------------------------------
@@ -61,8 +86,19 @@ class Agent:
 
         self._observe(state, user_message, turn)
 
+        # Tier 0 — the complete, valid, stdlib answer. This is what ships if the
+        # model tier is off, unreachable, slow, or wrong.
         docs, pool = self.ranker.rank(state, top_k)
-        speak = policy.should_emit(state, pool, turn, self.cfg)
+
+        # Tier 1 — augmentation only, over a result that is already correct.
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        if self._should_expand(state, pool, turn):
+            usage = self._expand(state)
+            if state.hyde_ranking:
+                docs, pool = self.ranker.rank(state, top_k)
+
+        speak = policy.should_emit(state, pool, turn, self.cfg,
+                                   getattr(self.ranker, "last_scored", None))
         if speak:
             state.record_emission(docs)
 
@@ -73,7 +109,73 @@ class Agent:
             "recommendations": (
                 [{"parent_asin": self.store.ids[d]} for d in docs] if speak else []
             ),
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": usage,
+        }
+
+    # -- optional model tier -----------------------------------------------
+    def _should_expand(self, state: DialogueState, pool: int, turn: int) -> bool:
+        """Is a generation worth a call on this turn?
+
+        `unsatisfied` fires only when no product satisfies every disclosed
+        constraint — the conjunction is then scoring a query no document can
+        answer, which is exactly the state a vocabulary mismatch produces. It is
+        the same signal `retrieval="auto"` reads, and it is self-diagnosing
+        rather than a benchmark detector.
+        """
+        if self.backend is None or state.hyde_turn == turn:
+            return False
+        gate = self.cfg.hyde_gate
+        if gate == "always":
+            return True
+        if gate == "unsatisfied":
+            return pool == 0
+        return False
+
+    def _ground(self, text: str) -> list[str]:
+        """Keep only generated terms the catalog actually contains.
+
+        A model that invents a word contributes nothing, and a word appearing in
+        a third of the catalog contributes noise. Both are dropped here, before
+        anything downstream can act on them — the same discipline `fuzzy.py`
+        applies to shopper typos. This is what separates HyDE from hallucination.
+        """
+        seen: set[str] = set()
+        kept: list[str] = []
+        for term in tokens(norm(text)):
+            if term in seen or term in DIALOGUE_STOP:
+                continue
+            if not self.index.informative(term, self.cfg.max_token_df_ratio):
+                continue
+            seen.add(term)
+            kept.append(term)
+        return kept
+
+    def _expand(self, state: DialogueState) -> dict:
+        """Generate, ground, and retrieve. Never raises; failure is a no-op."""
+        state.hyde_turn = state.turn
+        blank = {"prompt_tokens": 0, "completion_tokens": 0}
+        try:
+            expansion = self.backend.expand(
+                state.transcript(), self.cfg.hyde_timeout_s
+            )
+        except Exception:
+            # Defensive: a conforming backend already swallows its own failures,
+            # but a miss here would cost a whole session (spec line 65).
+            return blank
+        if not expansion.ok:
+            return blank
+
+        terms = self._ground(expansion.text)
+        if not terms:
+            return blank
+        state.hyde_text = " ".join(terms)
+        state.hyde_ranking = tuple(
+            doc for doc, _ in
+            self.bm25.score(state.hyde_text, self.cfg, self.cfg.hyde_depth)
+        )
+        return {
+            "prompt_tokens": expansion.prompt_tokens,
+            "completion_tokens": expansion.completion_tokens,
         }
 
     # -- turn handling -----------------------------------------------------
@@ -84,6 +186,8 @@ class Agent:
             # extraction, and the stored transcript all see corrected tokens.
             message = self.fuzzy.repair_message(message)
         state.messages.append(message)
+        if self.cfg.card_signature:
+            state.disclosed.update(extract.disclosed_constraints(message))
         if state.category_key is None:
             basis = state.transcript() if self.cfg.resolve_on_transcript else message
             key, docs, confidence = self.categories.resolve(

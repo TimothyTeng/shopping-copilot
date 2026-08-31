@@ -33,3 +33,13 @@ techjam-conversational-search/results.json
 
 # Logs / scratch
 *.log
+
+# Optional model-tier response cache (see src/backends/hyde.py)
+copilot/.hyde_cache.json
+copilot/.hyde_cache.tmp
+
+# Dense retrieval build output — 77 MB, regenerated in 34 s by
+# `python -m tools.build_dense`. The feature is off by default (dense_weight=0.0);
+# see copilot/docs/ALGORITHMS.md 3.2 for why.
+copilot/data/dense.npy
+copilot/data/dense.json

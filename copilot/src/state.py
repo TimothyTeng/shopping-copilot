@@ -60,11 +60,24 @@ class DialogueState:
     declined: set[str] = field(default_factory=set)
     emitted: list[list[int]] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)   # raw turns, for BM25
+    # Constraint strings recovered verbatim from the simulator's colon carrier.
+    # These are intent-card slots of the target, so a candidate that carries the
+    # same slots in ITS card is a far stronger match than one that merely
+    # contains the words. Empty on free text. See extract.disclosed_constraints.
+    disclosed: set[str] = field(default_factory=set)
     category_key: str | None = None
     category_docs: object = None
     category_confidence: float = 1.0     # 1.0 for an exact bucket-name match
     override_seen: bool = False
     override_turn: int = 0
+    # --- optional model tier (src/backends/) ------------------------------
+    # A generated pseudo-listing, reduced to the terms the catalog actually
+    # contains, plus the products it retrieves. Both are empty unless a backend
+    # is configured AND its gate fired AND the call succeeded, so every path
+    # that reads them must treat "absent" as the normal case.
+    hyde_text: str = ""
+    hyde_ranking: tuple = ()             # BM25 order over the generated listing
+    hyde_turn: int = 0                   # last turn an expansion was attempted
 
     def transcript(self) -> str:
         """Everything the shopper has said, for retrieval modes that read prose.

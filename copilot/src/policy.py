@@ -16,6 +16,8 @@ to a point, because never speaking scores zero.
 """
 from __future__ import annotations
 
+import math
+
 from .state import DialogueState
 
 # Order used only if "other" ever stops dominating. Derived from the measured
@@ -33,12 +35,37 @@ def choose_attribute(state: DialogueState) -> str | None:
     return None
 
 
-def should_emit(state: DialogueState, pool: int, turn: int, cfg) -> bool:
+def _confidence(scored: list[tuple[int, float, float]]) -> float:
+    """P(the leader is the target), from the score gap to the rest of the head.
+
+    A softmax over the head's scores. It is a calibration, not a probability —
+    but it is the quantity the emission decision actually needs, and it is
+    *state-dependent* in a way the three-way heuristic below is not: two
+    sessions with the same slot count can have a runaway leader or a flat tie,
+    and only one of them is worth committing to.
+    """
+    if not scored:
+        return 0.0
+    if len(scored) == 1:
+        return 1.0
+    peak = scored[0][1]
+    weights = [math.exp(total - peak) for _, total, _ in scored]
+    return weights[0] / sum(weights)
+
+
+def should_emit(state: DialogueState, pool: int, turn: int, cfg,
+                scored: list[tuple[int, float, float]] | None = None) -> bool:
     """Is the evidence strong enough that this list is worth committing to?"""
     if not cfg.gate_enabled:
         return True
     if turn >= cfg.gate_force_turn:
         return True
+    if cfg.gate_mode == "margin":
+        # Decision-theoretic form. A session ends at the first hit, so emitting
+        # locks the rank in: commit when the leader is probably the target, and
+        # keep asking when the head is a flat tie. Rank is worth ~13x a turn, so
+        # the threshold sits high.
+        return _confidence(scored or []) >= cfg.gate_confidence_min
     if len(state.active_slots()) >= cfg.gate_min_slots:
         return True
     return 0 < pool <= cfg.gate_pool_max

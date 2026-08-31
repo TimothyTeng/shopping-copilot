@@ -81,9 +81,26 @@ mechanics, and the measured-and-rejected log.
 ## Current state
 
 Benchmark `score 0.9456  hit@10 1.000  MRR 0.911  MTTC 2.38` (baseline 0.1067).
-The LLM augmentation (local Qwen query-rewriter over the `backends/` seam) is
-**scoped but not yet built** — the scored path is stdlib-only by design so it
-runs network-disabled.
+
+The LLM augmentation is **built and measured**: `src/backends/` holds the seam
+(protocol + null impl) and a HyDE rewriter that generates the product listing a
+shopper is describing and retrieves with that. It is **off by default**
+(`backend="null"`), so the scored path stays stdlib-only and runs
+network-disabled. Measured: it lifts the natural-language prose path
+`0.6339 → 0.6599` with recall held exactly, and *costs* the graded path
+(`0.9390`), so it is a free-text augmentation only. See `copilot/README.md`,
+"The optional model tier".
+
+To try it, with a local OpenAI-compatible server running:
+
+```bash
+COPILOT_LLM_BASE=http://localhost:30800/v1 \
+COPILOT_LLM_MODEL=Qwen/Qwen2.5-7B-Instruct \
+PYTHONIOENCODING=utf-8 python -m tools.llm_check      # smoke test + cost
+PYTHONIOENCODING=utf-8 python -m tools.llm_check --offline   # fallback proof
+PYTHONIOENCODING=utf-8 python -m tools.demo chat --backend hyde
+PYTHONIOENCODING=utf-8 python -m tools.stress --retrieval bm25 --set backend=hyde
+```
 
 ## Data use
 

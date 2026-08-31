@@ -38,6 +38,7 @@ Three things keep the result honest:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from array import array
@@ -48,6 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.bootstrap import paired_delta_ci, score_ci  # noqa: E402
 from tools.probes import FILLER, PROBES  # noqa: E402
 from tools.sim import KIT_ROOT  # noqa: E402  (puts the kit on sys.path)
 
@@ -88,6 +90,143 @@ def summarize(rows: list[dict]) -> dict:
 def line(label: str, s: dict, width: int = 26) -> str:
     return (f"  {label:<{width}} n={s['n']:<4} score {s['score']:.4f}   "
             f"hit {s['hit']:.3f}   mrr {s['mrr']:.3f}   mttc {s['mttc']:.2f}")
+
+
+# ---------------------------------------------------------------------------
+# comparing configurations
+# ---------------------------------------------------------------------------
+# Row labels, named once so the pairing code and the printing code cannot
+# disagree about which run is which.
+BASE = "agent (ours)"
+CONTROL = "BM25, whole transcript"
+MATCHED = "BM25, turn-matched"
+ORACLE = "oracle: product's own words"
+
+
+def sessions_from(rows: list[dict]) -> list[dict]:
+    """Stress results in the shape `tools.bootstrap` already consumes.
+
+    The bootstrap was written against the official evaluator's per-session
+    records and recomputes the composite from hit, reciprocal rank and
+    first-hit turn. Those are exactly the three things a stress probe produces,
+    so this is a rename, not a second implementation of the metric.
+    """
+    return [{"hit": 1 if r["rank"] is not None else 0,
+             "reciprocal_rank": (1.0 / r["rank"]) if r["rank"] is not None else 0.0,
+             "first_hit_turn": r["turn"] if r["rank"] is not None else None}
+            for r in rows]
+
+
+def delta_line(label: str, d) -> str:
+    """One paired delta, with the sign kept visible."""
+    sig = GREEN if d.lo > 0 else RED if d.hi < 0 else YELLOW
+    verdict = ("clears zero" if d.lo > 0 else
+               "below zero" if d.hi < 0 else "spans zero")
+    return (f"{label:<34} Δ {d.delta:+.4f}   95% CI [{d.lo:+.4f}, {d.hi:+.4f}]   "
+            f"p(Δ>0) {d.p_positive:.3f}   {sig}{verdict}{RESET}")
+
+
+def settings_from(args, extra: dict | None = None) -> config.Settings:
+    """The command line's overrides, plus a variant's own, over the default."""
+    overrides: dict = {"retrieval": args.retrieval}
+    if args.resolver is not None:
+        overrides["category_resolver"] = args.resolver
+    if args.gate_category_bonus:
+        overrides["gate_category_bonus"] = True
+    if args.reresolve:
+        overrides["reresolve_category"] = True
+    for pair in getattr(args, "sets", []):
+        field, value = pair.split("=", 1)
+        overrides[field] = _coerce(field, value)
+    for field, value in (extra or {}).items():
+        overrides[field] = _coerce(field, value)
+    return config.DEFAULT.replace(**overrides)
+
+
+def _coerce(field: str, value: str):
+    """Parse a KEY=VALUE string against the declared type of that setting."""
+    current = getattr(config.DEFAULT, field)
+    if isinstance(current, bool):
+        return value.lower() in ("1", "true", "yes", "on")
+    if isinstance(current, int):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    return value
+
+
+def parse_variant(spec: str) -> tuple[str, dict]:
+    """`label:key=value,key=value` — the label is optional and defaults to the
+    overrides themselves, which is usually the more honest name anyway.
+
+    Every key is checked against `Settings` here rather than at construction
+    time. A mistyped override that silently becomes a label, or a label that
+    silently becomes an override, would run for minutes and then report a
+    number for a configuration nobody asked for — which is worse than a crash,
+    because the number looks fine.
+    """
+    label = ""
+    if ":" in spec and "=" not in spec.split(":", 1)[0]:
+        label, spec = spec.split(":", 1)
+    overrides = {}
+    for pair in spec.split(","):
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise SystemExit(
+                f"--vs {spec!r}: '{pair}' is not key=value. Expected "
+                f"'label:key=value,key=value' — and a label may not contain '='.")
+        field, value = pair.split("=", 1)
+        field = field.strip()
+        if not hasattr(config.DEFAULT, field):
+            raise SystemExit(
+                f"--vs {spec!r}: '{field}' is not a Settings field. "
+                f"(If it was meant as a label, labels may not contain '='.)")
+        overrides[field] = value
+    if not overrides:
+        raise SystemExit(f"--vs {spec!r}: no overrides given.")
+    return (label or spec), overrides
+
+
+def crosstab(probes: list[dict], runs: dict[str, list[dict]],
+             labels: list[str]) -> None:
+    """Score per tag per configuration, with the per-tag winner marked.
+
+    The point of this table is not the totals — those are already printed. It
+    is whether a configuration that loses overall wins *anywhere*. A mode that
+    never leads a single tag is not a trade-off, it is dead weight.
+    """
+    tags: dict[str, list[int]] = defaultdict(list)
+    for i, probe in enumerate(probes):
+        for tag in probe["tags"]:
+            tags[tag].append(i)
+
+    width = max(len(t) for t in tags) + 2 if tags else 10
+    print(f"\n{BOLD}TAG × CONFIGURATION{RESET}  {DIM}composite score; "
+          f"{GREEN}green{RESET}{DIM} is the winner for that tag{RESET}")
+    header = f"  {'tag':<{width}}{'n':<5}" + "".join(f"{l[:20]:<22}" for l in labels)
+    print(f"{DIM}{header}{RESET}")
+    wins = Counter()
+    for tag in sorted(tags):
+        idx = tags[tag]
+        scores = [summarize([runs[l][i] for i in idx])["score"] for l in labels]
+        # A tag every configuration scores identically on — usually all-zero —
+        # has no winner. Crediting one to whichever column sorted first would
+        # put fake leads in the very count this table exists to produce.
+        best = (max(range(len(scores)), key=lambda k: scores[k])
+                if max(scores) > min(scores) else None)
+        if best is not None:
+            wins[labels[best]] += 1
+        cells = "".join(
+            (f"{GREEN}{scores[k]:<22.4f}{RESET}" if k == best
+             else f"{scores[k]:<22.4f}")
+            for k in range(len(scores)))
+        print(f"  {tag:<{width}}{len(idx):<5}{cells}")
+    print(f"\n{DIM}  tags led: "
+          + ", ".join(f"{l} {wins[l]}" for l in labels) + f"{RESET}")
+    dead = [l for l in labels if wins[l] == 0]
+    if dead:
+        print(f"  {YELLOW}leads no tag at all: {', '.join(dead)}{RESET}")
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +277,35 @@ def run_agent_probe(agent: Agent, probe: dict, target_doc: int) -> dict:
     return {"rank": None, "turn": 11, "why": "", "transcript": transcript}
 
 
+def run_turnmatched(search, probe: dict, target_doc: int) -> dict:
+    """A stateless retriever that hears the same words on the same turn.
+
+    The one-shot control below is handed the WHOLE transcript on turn 1, which
+    is generous on purpose — but it makes that control unreadable on any probe
+    whose decisive word arrives late. It cannot lose the turns the agent spends
+    waiting for the shopper to say the thing that matters, so part of its lead
+    is information the agent did not have yet, not retrieval the agent got
+    wrong.
+
+    This one is the honest comparison: at turn t it sees exactly `turns[:t]`,
+    and nothing else. No state, no slots, no category. A gap that survives
+    against THIS is dialogue handling; a gap that only appears against the
+    one-shot control is the asymmetry.
+
+    Measured worth: on the `brand` tag the one-shot control scores 0.8636
+    against the agent's 0.7171, which reads as a large defect. The turn-matched
+    control scores 0.7678 — two thirds of that gap was the asymmetry, and the
+    remainder does not clear zero (+0.051, 95% CI [-0.045, +0.148]).
+    """
+    for turn in range(1, MAX_TURNS + 1):
+        said = probe["turns"][:turn] or [FILLER[0]]
+        docs = search(" ".join(said), TOP_K)
+        if target_doc in docs:
+            return {"rank": docs.index(target_doc) + 1, "turn": turn, "why": "",
+                    "transcript": []}
+    return {"rank": None, "turn": 11, "why": "", "transcript": []}
+
+
 def run_oneshot(search, probe: dict, target_doc: int) -> dict:
     """A stateless retriever gets the whole transcript at once, on turn 1.
 
@@ -155,6 +323,39 @@ def run_oneshot(search, probe: dict, target_doc: int) -> dict:
 # ---------------------------------------------------------------------------
 # honesty controls
 # ---------------------------------------------------------------------------
+def load_probes(path: str | None) -> list[dict]:
+    """The hand-authored 26, or a generated set from `tools/genprobes.py`.
+
+    The hand-authored set stays the default and stays authoritative: it was
+    written by a person who had not seen the agent's behaviour, and no model
+    wrote a word of it. A generated set buys statistical resolution that n=26
+    cannot give, at the cost of being written by a model — so it is opt-in, and
+    its provenance is printed rather than assumed.
+    """
+    if not path:
+        return PROBES
+    file = Path(path)
+    if not file.is_absolute():
+        file = ROOT / file
+    probes: list[dict] = []
+    meta: dict = {}
+    with file.open(encoding="utf-8") as handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            row = json.loads(raw)
+            if "_meta" in row:
+                meta = row["_meta"]
+                continue
+            probes.append(row)
+    print(f"{YELLOW}  generated probe set: {file.name}  n={len(probes)}  "
+          f"model={meta.get('model', '?')}{RESET}")
+    if meta.get("warning"):
+        print(f"{DIM}  {meta['warning']}{RESET}")
+    return probes
+
+
 def verbatim_overlap(probe: dict, store: CatalogStore, doc: int) -> float:
     """Share of the shopper's content words that occur in the target's text.
 
@@ -199,90 +400,107 @@ def diagnose(agent: Agent, probe: dict, store: CatalogStore, index: InvertedInde
 
 # ---------------------------------------------------------------------------
 def cmd_natural(args) -> None:
+    # Parsed before anything expensive happens. A malformed --vs discovered
+    # after a 427-probe base run has already cost the run it invalidates.
+    specs = [parse_variant(s) for s in getattr(args, "vs", [])]
     print(f"{DIM}loading catalog…{RESET}")
-    overrides = {"retrieval": args.retrieval}
-    if args.resolver is not None:
-        overrides["category_resolver"] = args.resolver
-    if args.gate_category_bonus:
-        overrides["gate_category_bonus"] = True
-    if args.reresolve:
-        overrides["reresolve_category"] = True
-    for pair in getattr(args, "sets", []):
-        field, value = pair.split("=", 1)
-        current = getattr(config.DEFAULT, field)
-        if isinstance(current, bool):
-            value = value.lower() in ("1", "true", "yes", "on")
-        elif isinstance(current, int):
-            value = int(value)
-        elif isinstance(current, float):
-            value = float(value)
-        overrides[field] = value
-    settings = config.DEFAULT.replace(**overrides)
-    agent = Agent(config.CATALOG_PATH, settings)
+    base_settings = settings_from(args)
+    agent = Agent(config.CATALOG_PATH, base_settings)
     store, index = agent.store, agent.index
     print(f"{DIM}building independent BM25 control…{RESET}")
     bm25 = Bm25(store)
 
-    missing = [p for p in PROBES if p["target"] not in store.ord_of]
+    source = load_probes(getattr(args, "probes", None))
+    missing = [p for p in source if p["target"] not in store.ord_of]
     if missing:
         print(f"{RED}targets not in catalog: {[p['id'] for p in missing]}{RESET}")
-    probes = [p for p in PROBES if p["target"] in store.ord_of]
+    probes = [p for p in source if p["target"] in store.ord_of]
+    docs_of = [store.ord_of[p["target"]] for p in probes]
 
-    runs: dict[str, list[dict]] = defaultdict(list)
-    by_tag: dict[str, list[dict]] = defaultdict(list)
-    rows = []
+    # Every run below walks `probes` in this one order, so results line up
+    # position-for-position and the paired bootstrap is valid by construction.
+    runs: dict[str, list[dict]] = {}
+    runs[BASE] = [run_agent_probe(agent, p, d) for p, d in zip(probes, docs_of)]
+    runs[CONTROL] = [run_oneshot(bm25.search, p, d) for p, d in zip(probes, docs_of)]
+    runs[MATCHED] = [run_turnmatched(bm25.search, p, d)
+                     for p, d in zip(probes, docs_of)]
+    runs[ORACLE] = [
+        run_oneshot(bm25.search,
+                    # The ceiling: query with the product's own words, which is
+                    # the advantage the official simulator hands us for free.
+                    {"turns": [" ".join((store.raw_title[d], store.text[d][:600]))]},
+                    d)
+        for d in docs_of
+    ]
 
-    for probe in probes:
-        doc = store.ord_of[probe["target"]]
-        overlap = verbatim_overlap(probe, store, doc)
+    # Extra configurations, each a full agent over the identical probes. Built
+    # and dropped one at a time: two catalogs in memory is the price of one
+    # comparison, and there is no reason to pay it N times over.
+    variants: list[str] = []
+    for label, overrides in specs:
+        print(f"{DIM}running variant {label}: {overrides}…{RESET}")
+        other = Agent(config.CATALOG_PATH, settings_from(args, overrides))
+        runs[label] = [run_agent_probe(other, p, d) for p, d in zip(probes, docs_of)]
+        variants.append(label)
+        del other
 
-        agent_result = run_agent_probe(agent, probe, doc)
-        bm25_result = run_oneshot(bm25.search, probe, doc)
-        # The ceiling: query with the product's own words, which is the
-        # advantage the official simulator hands us on every session.
-        oracle_text = " ".join((store.raw_title[doc], store.text[doc][:600]))
-        oracle_result = run_oneshot(
-            bm25.search, {"turns": [oracle_text]}, doc
-        )
-
-        runs["agent (ours)"].append(agent_result)
-        runs["BM25, whole transcript"].append(bm25_result)
-        runs["oracle: product's own words"].append(oracle_result)
-        for tag in probe["tags"]:
-            by_tag[tag].append(agent_result)
-
-        rows.append((probe, doc, overlap, agent_result, bm25_result, oracle_result))
+    overlaps = [verbatim_overlap(p, store, d) for p, d in zip(probes, docs_of)]
 
     print(f"\n{BOLD}NATURAL-LANGUAGE STRESS TEST{RESET}   "
           f"{len(probes)} probes, official metric")
     print(f"{DIM}  targets chosen before any wording was written; nothing tuned "
           f"on this set{RESET}\n")
-    for label in ("agent (ours)", "BM25, whole transcript",
-                  "oracle: product's own words"):
+    for label in [BASE] + variants + [MATCHED, CONTROL, ORACLE]:
         print(line(label, summarize(runs[label])))
 
-    mean_overlap = sum(r[2] for r in rows) / len(rows)
+    mean_overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
     print(f"\n{DIM}  mean verbatim overlap with the target: {mean_overlap:.2f}"
           f"  (1.00 would mean the probes quote the product page){RESET}")
 
+    # ---- is the difference real? ----------------------------------------
+    # A point estimate cannot tell a 0.015 effect from a 0.015 resample. These
+    # are paired: one bootstrap draw picks a set of probe indices and scores
+    # both configs on that same set, so the probe-to-probe variance that
+    # dominates an unpaired interval cancels out.
+    if not args.no_ci:
+        iters, seed = args.boot_iters, args.boot_seed
+        ci = score_ci(sessions_from(runs[BASE]), iters=iters, seed=seed)
+        print(f"\n{BOLD}PAIRED BOOTSTRAP{RESET}  {DIM}{iters} resamples over the "
+              f"{len(probes)} probes, seed {seed}{RESET}")
+        print(f"  {BASE:<26} {ci.point:.4f}   95% CI "
+              f"[{ci.lo:.4f}, {ci.hi:.4f}]")
+        pairs = [(CONTROL, BASE), (MATCHED, BASE)] + [(BASE, v) for v in variants]
+        for left, right in pairs:
+            d = paired_delta_ci(sessions_from(runs[left]), sessions_from(runs[right]),
+                                iters=iters, seed=seed)
+            print("  " + delta_line(f"{right} − {left}", d))
+
     print(f"\n{BOLD}BY TAG{RESET}  {DIM}(agent only; small n, read as direction "
           f"not measurement){RESET}")
+    by_tag: dict[str, list[dict]] = defaultdict(list)
+    for probe, result in zip(probes, runs[BASE]):
+        for tag in probe["tags"]:
+            by_tag[tag].append(result)
     for tag in sorted(by_tag):
         print(line(tag, summarize(by_tag[tag]), width=20))
 
+    if args.crosstab:
+        crosstab(probes, runs, [BASE] + variants + [MATCHED, CONTROL])
+
     if args.show:
         print(f"\n{BOLD}PER PROBE{RESET}")
-        for probe, doc, overlap, ares, bres, ores in rows:
+        for i, probe in enumerate(probes):
             def mark(r):
                 if r["rank"] is None:
                     return f"{RED}miss{RESET}"
                 colour = GREEN if r["rank"] == 1 else YELLOW
                 return f"{colour}r{r['rank']}@t{r['turn']}{RESET}"
+            doc, ares = docs_of[i], runs[BASE][i]
             print(f"\n  {BOLD}{probe['id']}{RESET}  "
-                  f"{DIM}[{','.join(probe['tags'])}]  overlap {overlap:.2f}{RESET}")
+                  f"{DIM}[{','.join(probe['tags'])}]  overlap {overlaps[i]:.2f}{RESET}")
             print(f"    {DIM}target {store.raw_title[doc][:66]}{RESET}")
-            print(f"    agent {mark(ares)}    bm25 {mark(bres)}    "
-                  f"oracle {mark(ores)}")
+            print(f"    agent {mark(ares)}    bm25 {mark(runs[CONTROL][i])}    "
+                  f"oracle {mark(runs[ORACLE][i])}")
             why = diagnose(agent, probe, store, index, doc, ares)
             if why:
                 print(f"    {DIM}why: {why}{RESET}")
@@ -372,8 +590,24 @@ def main() -> None:
     parser.add_argument("--set", dest="sets", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="override any Settings field (repeatable)")
+    parser.add_argument("--probes", default=None, metavar="PATH",
+                        help="a generated probe set from tools.genprobes "
+                             "(default: the 26 hand-authored probes)")
     parser.add_argument("--show", action="store_true",
                         help="per-probe detail and failure reasons")
+    parser.add_argument("--vs", action="append", default=[], metavar="SPEC",
+                        help="a second configuration to run over the SAME probes, "
+                             "as 'label:key=value,key=value' (repeatable). Each is "
+                             "reported with a paired bootstrap delta against the "
+                             "base run.")
+    parser.add_argument("--crosstab", action="store_true",
+                        help="score per tag per configuration, winner marked")
+    parser.add_argument("--boot-iters", type=int, default=10000,
+                        help="bootstrap resamples (default 10000)")
+    parser.add_argument("--boot-seed", type=int, default=0,
+                        help="bootstrap seed, so a reported interval reproduces")
+    parser.add_argument("--no-ci", action="store_true",
+                        help="skip the bootstrap block")
     args = parser.parse_args()
     if args.track in ("all", "natural"):
         cmd_natural(args)
